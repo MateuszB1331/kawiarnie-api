@@ -1,0 +1,18 @@
+# Konfiguracja deploymentu na Render.com
+# Umieść ten plik w głównym folderze repozytorium Git.
+
+services:
+  - type: web
+    name: kawiarnie-api
+    env: node
+    region: frankfurt          # Serwer w Europie — mniejsze opóźnienia
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: API_KEY
+        generateValue: true    # Render wygeneruje losowy klucz automatycznie
+      - key: NODE_ENV
+        value: production
+    # Render free tier: usypia po 15 min braku ruchu, budzi się po ~30s
+    # Dla dashboardu właściciela to akceptowalne.
