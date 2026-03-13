@@ -98,6 +98,29 @@ function parseHoursStr(str) {
   return isNaN(n) ? 0 : n;
 }
 
+// "08:00" → minuty od północy; null gdy nieprawidłowy format
+function timeToMinutes(t) {
+  const m = String(t || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+// Oblicz liczbę godzin (decimal) między "08:00" a "16:00" (obsługa przekroczenia północy)
+function calcHoursFromRange(from, to) {
+  const f = timeToMinutes(from);
+  const t = timeToMinutes(to);
+  if (f === null || t === null) return 0;
+  const diff = t >= f ? t - f : (24 * 60 - f) + t;
+  return diff / 60;
+}
+
+// Godziny decimal → "3:15"
+function decimalToHHMM(dec) {
+  const h = Math.floor(dec);
+  const m = Math.round((dec - h) * 60);
+  return `${h}:${String(m).padStart(2, '0')}`;
+}
+
 function today() { return new Date().toISOString().slice(0, 10); }
 
 // Normalizuje różne formaty dat do YYYY-MM-DD
@@ -124,11 +147,11 @@ function stripHexPrefix(name) {
   return name.replace(/^[0-9a-f]{6,}[_\-]/i, '');
 }
 
-// Parser CSV godzin: Pracownik,Data,Godziny
+// Parser CSV godzin: Pracownik,Data,[Od,Do,]Godziny
 function parseHoursCSV(text, fallbackDate) {
   const lines = text.split(/\r?\n/);
   const records = [];
-  let headerIdx = { name: -1, date: -1, hours: -1 };
+  let headerIdx = { name: -1, date: -1, hours: -1, from: -1, to: -1 };
   let headerFound = false;
 
   for (const rawLine of lines) {
@@ -138,19 +161,39 @@ function parseHoursCSV(text, fallbackDate) {
 
     if (!headerFound) {
       const lower = cols.map(c => c.toLowerCase());
-      const ni = lower.findIndex(c => c.includes('pracownik') || c.includes('imię') || c.includes('imie') || c.includes('name'));
-      const di = lower.findIndex(c => c.includes('data') || c.includes('date'));
-      const hi = lower.findIndex(c => c.includes('godzin') || c.includes('czas') || c.includes('hour') || c.includes('time'));
-      if (ni !== -1 && hi !== -1) { headerIdx = { name: ni, date: di, hours: hi }; headerFound = true; }
+      const ni   = lower.findIndex(c => c.includes('pracownik') || c.includes('imię') || c.includes('imie') || c.includes('name'));
+      const di   = lower.findIndex(c => c.includes('data') || c.includes('date'));
+      const fi   = lower.findIndex(c => c === 'od' || c === 'from' || c.includes('start') || c.includes('pocz'));
+      const ti   = lower.findIndex(c => c === 'do' || c === 'to'   || c.includes('koniec') || c.includes('end'));
+      const hi   = lower.findIndex(c => c.includes('godzin') || c.includes('czas') || c.includes('hour'));
+      if (ni !== -1 && (hi !== -1 || (fi !== -1 && ti !== -1))) {
+        headerIdx = { name: ni, date: di, hours: hi, from: fi, to: ti };
+        headerFound = true;
+      }
       continue;
     }
 
     if (cols.length < 2) continue;
-    const name  = cols[headerIdx.name] || '';
-    const date  = (headerIdx.date >= 0 ? cols[headerIdx.date] : null) || fallbackDate || today();
-    const hours = cols[headerIdx.hours] || '0';
+    const name     = cols[headerIdx.name] || '';
+    const date     = normalizeDate((headerIdx.date >= 0 ? cols[headerIdx.date] : null) || fallbackDate || today());
+    const timeFrom = headerIdx.from >= 0 ? cols[headerIdx.from] || '' : '';
+    const timeTo   = headerIdx.to   >= 0 ? cols[headerIdx.to]   || '' : '';
+
+    let hours = headerIdx.hours >= 0 ? cols[headerIdx.hours] || '0' : '0';
+    // Jeśli brak kolumny godzin a są Od/Do — oblicz automatycznie
+    if ((hours === '0' || hours === '') && timeFrom && timeTo) {
+      const dec = calcHoursFromRange(timeFrom, timeTo);
+      hours = decimalToHHMM(dec);
+    }
     if (!name) continue;
-    records.push({ name, date, hoursStr: hours, hoursDecimal: parseHoursStr(hours) });
+    records.push({
+      name,
+      date,
+      timeFrom,
+      timeTo,
+      hoursStr:     hours,
+      hoursDecimal: parseHoursStr(hours),
+    });
   }
   return records;
 }
@@ -252,12 +295,25 @@ app.post('/api/ingest/hours', auth, (req, res) => {
   if (!records || !Array.isArray(records)) return res.status(400).json({ error: 'Wymagane: records[] z polami name, hoursStr, hoursDecimal' });
 
   const d = normalizeDate(date);
-  const incoming = records.map(r => ({
-    name:         String(r.name || '').trim(),
-    date:         r.date || d,
-    hoursStr:     String(r.hoursStr || r.hours || '0'),
-    hoursDecimal: typeof r.hoursDecimal === 'number' ? r.hoursDecimal : parseHoursStr(r.hoursStr || r.hours || '0'),
-  })).filter(r => r.name);
+  const incoming = records.map(r => {
+    const timeFrom = String(r.timeFrom || r.from || '').trim();
+    const timeTo   = String(r.timeTo   || r.to   || '').trim();
+    // Jeśli przesłano przedział czasowy ale brak hoursStr — oblicz automatycznie
+    let hoursStr = String(r.hoursStr || r.hours || '0');
+    let hoursDecimal = typeof r.hoursDecimal === 'number' ? r.hoursDecimal : parseHoursStr(hoursStr);
+    if ((hoursStr === '0' || hoursStr === '') && timeFrom && timeTo) {
+      hoursDecimal = calcHoursFromRange(timeFrom, timeTo);
+      hoursStr = decimalToHHMM(hoursDecimal);
+    }
+    return {
+      name:    String(r.name || '').trim(),
+      date:    normalizeDate(r.date || d),
+      timeFrom,
+      timeTo,
+      hoursStr,
+      hoursDecimal,
+    };
+  }).filter(r => r.name);
 
   if (incoming.length === 0) return res.status(400).json({ error: 'Brak prawidłowych rekordów.' });
 
