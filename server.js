@@ -100,6 +100,30 @@ function parseHoursStr(str) {
 
 function today() { return new Date().toISOString().slice(0, 10); }
 
+// Normalizuje różne formaty dat do YYYY-MM-DD
+// Akceptuje: "2026-03-13", "13.03.2026", "13/03/2026", "2026.03.13"
+function normalizeDate(raw) {
+  if (!raw) return today();
+  const s = String(raw).trim();
+  // Już poprawny format YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // Format DD.MM.YYYY lub DD/MM/YYYY
+  const dmy = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
+  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}`;
+  // Format YYYY.MM.DD
+  const ymd = s.match(/^(\d{4})[./](\d{2})[./](\d{2})$/);
+  if (ymd) return `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+  // Fallback: Date.parse
+  const d = new Date(s);
+  if (!isNaN(d)) return d.toISOString().slice(0, 10);
+  return today();
+}
+
+// Usuwa prefix hex z nazwy pliku (np. "174244b46_lokalizacja.csv" → "lokalizacja")
+function stripHexPrefix(name) {
+  return name.replace(/^[0-9a-f]{6,}[_\-]/i, '');
+}
+
 // Parser CSV godzin: Pracownik,Data,Godziny
 function parseHoursCSV(text, fallbackDate) {
   const lines = text.split(/\r?\n/);
@@ -196,7 +220,8 @@ app.get('/api/hours', auth, (_req, res) => res.json(loadHours()));
 
 // POST raport dzienny (JSON)
 app.post('/api/ingest/daily', auth, (req, res) => {
-  const { location, date, products, finance, notes } = req.body;
+  const { location, products, finance, notes } = req.body;
+  const date = normalizeDate(req.body.date);
   if (!location || !date) return res.status(400).json({ error: 'Wymagane: location, date' });
   const store = loadStore();
   const key = `${location}__${date}`;
@@ -226,7 +251,7 @@ app.post('/api/ingest/hours', auth, (req, res) => {
   const { date, records } = req.body;
   if (!records || !Array.isArray(records)) return res.status(400).json({ error: 'Wymagane: records[] z polami name, hoursStr, hoursDecimal' });
 
-  const d = date || today();
+  const d = normalizeDate(date);
   const incoming = records.map(r => ({
     name:         String(r.name || '').trim(),
     date:         r.date || d,
@@ -250,14 +275,20 @@ app.post('/api/ingest/hours', auth, (req, res) => {
 app.post('/api/ingest/csv', auth, upload.single('file'), (req, res) => {
   let csvText = '';
   let location = req.body?.location || req.query.location || '';
-  let date     = req.body?.date     || req.query.date     || today();
+  let date     = normalizeDate(req.body?.date || req.query.date);
 
   if (req.file) {
     csvText  = req.file.buffer.toString('utf8');
-    if (!location) location = req.file.originalname.replace(/\.csv$/i,'').split(/[-_]/)[0].trim();
+    if (!location) {
+      // Wyciągnij lokalizację z nazwy pliku, pomijając ewentualny prefiks hex
+      const cleanName = stripHexPrefix(req.file.originalname.replace(/\.csv$/i, ''));
+      location = cleanName.split(/[-_]/)[0].trim();
+    }
   } else if (typeof req.body === 'string' && req.body.trim()) {
     csvText = req.body;
   }
+
+  console.log(`  → location="${location}" date="${date}" file="${req.file?.originalname || '(brak)'}"`);
 
   if (!csvText.trim()) return res.status(400).json({ error: 'Brak danych CSV.' });
 
@@ -291,10 +322,25 @@ app.post('/api/ingest/csv', auth, upload.single('file'), (req, res) => {
   res.json({ ok: true, type, key });
 });
 
+// GET diagnostyczny — lista kluczy i dat w bazie (bez auth dla łatwości debugowania, tylko GET)
+app.get('/api/debug/keys', auth, (_req, res) => {
+  const store = loadStore();
+  const dailyKeys     = Object.keys(store.daily).sort();
+  const inventoryKeys = Object.keys(store.inventory).sort();
+  const hours         = loadHours();
+  res.json({
+    daily:     dailyKeys,
+    inventory: inventoryKeys,
+    hours:     hours.length,
+    locations: store.locations,
+    hoursRecords: hours.map(r => `${r.name} / ${r.date} / ${r.hoursStr}`),
+  });
+});
+
 // 404
 app.use((req, res) => res.status(404).json({
   error: 'Endpoint nie istnieje.',
-  available: ['GET /health','GET /api/data','GET /api/hours','POST /api/ingest/daily','POST /api/ingest/inventory','POST /api/ingest/csv','POST /api/ingest/hours']
+  available: ['GET /health','GET /api/data','GET /api/hours','GET /api/debug/keys','POST /api/ingest/daily','POST /api/ingest/inventory','POST /api/ingest/csv','POST /api/ingest/hours']
 }));
 
 app.listen(PORT, () => {
